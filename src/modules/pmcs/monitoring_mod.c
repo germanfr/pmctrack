@@ -15,6 +15,7 @@
 #include <linux/semaphore.h>
 #include <linux/module.h>
 #include <pmc/smart_power.h>
+#include <pmc/smart_power_2.h>
 #include <linux/uaccess.h>
 
 #ifdef DEBUG
@@ -277,6 +278,10 @@ extern monitoring_module_t vexpress_sensors_mm;
 #ifdef CONFIG_SMART_POWER
 extern monitoring_module_t spower_mm;
 #endif
+#ifdef CONFIG_SMART_POWER_2
+extern monitoring_module_t spower2_mm;
+#endif
+
 
 /* Init monitoring module manager */
 int init_mm_manager(struct proc_dir_entry* pmc_dir)
@@ -313,6 +318,13 @@ int init_mm_manager(struct proc_dir_entry* pmc_dir)
 		return ret;
 	}
 #endif
+#ifdef CONFIG_SMART_POWER_2
+	if ((ret=spower2_register_driver())) {
+		remove_proc_entry("mm_manager", pmc_dir);
+		printk(KERN_INFO "Couldn't register Odroid Smart Power 2 USB driver\n");
+		return ret;
+	}
+#endif
 
 	/*
 	 * This is the place where the various
@@ -336,6 +348,9 @@ int init_mm_manager(struct proc_dir_entry* pmc_dir)
 #ifdef CONFIG_SMART_POWER
 	load_monitoring_module(&spower_mm);
 #endif
+#ifdef CONFIG_SMART_POWER_2
+	load_monitoring_module(&spower2_mm);
+#endif
 
 	return 0;
 }
@@ -354,6 +369,9 @@ void destroy_mm_manager(struct proc_dir_entry* pmc_dir)
 	}
 #ifdef CONFIG_SMART_POWER
 	spower_unregister_driver();
+#endif
+#ifdef CONFIG_SMART_POWER_2
+	spower2_unregister_driver();
 #endif
 	remove_proc_entry("mm_manager", pmc_dir);
 }
