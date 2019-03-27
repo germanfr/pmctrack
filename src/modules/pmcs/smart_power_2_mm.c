@@ -10,12 +10,28 @@
  *  This code is licensed under the GNU GPL v2.
  */
 
+#include <linux/ctype.h>
+#include <linux/delay.h>
+#include <linux/kthread.h>
+#include <linux/rwlock.h>
 #include <pmc/hl_events.h>
 #include <pmc/mc_experiments.h>
 #include <pmc/monitoring_mod.h>
-#include <pmc/smart_power_2.h>
+#include <pmc/data_str/cbuffer.h>
 
 #define SPOWER2_MODULE_STR "Odroid Smart Power 2"
+#define SPOWER2_INPUT_FILE_PATH "/dev/ttyUSB0"
+#define CBUFFER_CAPACITY 16
+
+/* Structure to represent a sample gathered by Odroid SmartPower */
+struct spower2_sample {
+	int m_volts;
+	int m_ampere;
+	int m_watt;
+	int m_watthour;
+	int m_ujoules;
+	unsigned long timestamp;
+};
 
 /* Per-thread private data for this monitoring module */
 typedef struct {
@@ -24,10 +40,31 @@ typedef struct {
 	int security_id;
 } spower2_thread_data_t;
 
+
+struct spower2_ctl {
+	struct task_struct* reader_thread; /* Thread that keeps putting data into the buffer */
+	struct file* input_file;           /* Pointer to the data input file */
+	cbuffer_t* cbuffer;                /* Sample buffer */
+	unsigned long time_last_sample;    /* Required for energy estimation */
+	uint64_t cummulative_energy;       /* Counter to keep track of cumulative energy consumption */
+	rwlock_t lock;                     /* RW lock for the various fields */
+} spower2_gbl;
+
 enum {SPOWER2_POWER=0,SPOWER2_CURRENT,SPOWER2_ENERGY,SPOWER2_NR_MEASUREMENTS};
 
 
-/* Return the capabilities/properties of this monitoring module */
+static int get_summary_samples(unsigned long timestamp, struct spower2_sample* sample);
+static int spower2_get_sample(unsigned long from, struct spower2_sample* sample);
+static int spower2_parse_float(const char* str, int* val);
+static noinline int spower2_parse_sample(const char* str, struct spower2_sample* sample);
+static int spower2_read_from_file(struct spower2_sample* sample);
+static int spower2_thread_fn(void *data);
+
+
+/*
+ * [PMCTrack API]
+ * Return the capabilities/properties of this monitoring module.
+ */
 static void spower2_module_counter_usage(monitoring_module_counter_usage_t* usage)
 {
 	usage->hwpmc_mask=0;
@@ -38,53 +75,96 @@ static void spower2_module_counter_usage(monitoring_module_counter_usage_t* usag
 	usage->vcounter_desc[SPOWER2_ENERGY]="energy_uj";
 }
 
-/* MM initialization */
+/*
+ * [PMCTrack API]
+ * MM initialization
+ */
 static int spower2_enable_module(void)
 {
-	int retval=0;
+	// Open input file and start reading measurements
+	struct file* input_file = filp_open(SPOWER2_INPUT_FILE_PATH, O_RDONLY, 0);
+	if(IS_ERR(input_file)) {
+		return PTR_ERR(input_file);
+	}
+	spower2_gbl.input_file = input_file;
 
-	if ((retval=spower2_start_measurements()))
-		return retval;
+
+	spower2_gbl.cbuffer = create_cbuffer_t(CBUFFER_CAPACITY * sizeof(struct spower2_sample));
+	if (!spower2_gbl.cbuffer) { // Free previously opened resources
+		filp_close(spower2_gbl.input_file, NULL);
+		spower2_gbl.input_file = NULL;
+		return -ENOMEM;
+	}
+
+	rwlock_init(&spower2_gbl.lock);
+
+	spower2_gbl.reader_thread = kthread_run(spower2_thread_fn, NULL, "spower-reader");
+	if (!spower2_gbl.reader_thread) { // Free previously opened resources
+		filp_close(spower2_gbl.input_file, NULL);
+		spower2_gbl.input_file = NULL;
+		destroy_cbuffer_t(spower2_gbl.cbuffer);
+		spower2_gbl.cbuffer = NULL;
+		return -1;
+	}
 
 	return 0;
 }
 
-/* MM cleanup function */
+/*
+ * [PMCTrack API]
+ * MM cleanup function
+ */
 static void spower2_disable_module(void)
 {
-	spower2_stop_measurements();
-	printk(KERN_ALERT "%s monitoring module unloaded!!\n",SPOWER2_MODULE_STR);
+	// Stop reading measuremennts and close input file
+
+	if (spower2_gbl.reader_thread) {
+		kthread_stop(spower2_gbl.reader_thread);
+		spower2_gbl.reader_thread = NULL;
+	}
+
+	if (spower2_gbl.input_file) {
+		filp_close(spower2_gbl.input_file, NULL);
+		spower2_gbl.input_file = NULL;
+	}
+
+	if (spower2_gbl.cbuffer) {
+		destroy_cbuffer_t(spower2_gbl.cbuffer);
+		spower2_gbl.cbuffer = NULL;
+	}
+
+	printk(KERN_ALERT "%s monitoring module unloaded!!\n", SPOWER2_MODULE_STR);
 }
 
-
-/* Display configuration parameters */
+/*
+ * [PMCTrack API]
+ * Display configuration parameters
+ */
 static int spower2_on_read_config(char* str, unsigned int len)
 {
 	char* dst=str;
 
-	dst+=sprintf(dst,"spower2_sampling_period = %u\n",spower2_get_sampling_period());
-	dst+=sprintf(dst,"spower2_cummulative_energy = %llu\n",spower2_get_energy_count());
+	dst += sprintf(dst, "spower2_cummulative_energy = %llu\n", spower2_gbl.cummulative_energy);
 
 	return dst - str;
 }
 
-/* Change configuration parameters */
+/*
+ * [PMCTrack API]
+ * Change configuration parameters
+ */
 static int spower2_on_write_config(const char *str, unsigned int len)
 {
-	int val;
-	int ret;
-
-	if (sscanf(str,"spower2_sampling_period %d",&val)==1) {
-		if ((ret=spower2_set_sampling_period(val)))
-			return ret;
-		return len;
-	} else if (strncmp(str,"reset_energy_count",18)==0) {
-		spower2_reset_energy_count();
+	if (strncmp(str, "reset_energy_count", 18) == 0) {
+		spower2_gbl.cummulative_energy = 0;
 	}
 	return 0;
 }
 
-/* on fork() callback */
+/*
+ * [PMCTrack API]
+ * on fork() callback
+ */
 static int spower2_on_fork(unsigned long clone_flags, pmon_prof_t* prof)
 {
 	spower2_thread_data_t*  data= NULL;
@@ -104,7 +184,154 @@ static int spower2_on_fork(unsigned long clone_flags, pmon_prof_t* prof)
 	return 0;
 }
 
+/* Custom version to parse float that uses 1000 as the default scale factor */
+static int spower2_parse_float(const char* str, int* val)
+{
+	int len = 0;
+	int unit = 0;
+	int dec = 0;
+
+	while (!isdigit(*str) && (*str) != '-') {
+		str++;
+		len++;
+	}
+
+	if (sscanf(str, "%d.%d", &unit, &dec) != 2)
+		(*val) = -1;
+	else
+		(*val) = unit * 1000 + dec;
+
+#ifdef DEBUG
+	trace_printk("unit=%d,dec=%d\n", unit, dec);
+#endif
+
+	if (*str == '-') {
+		/* Move forward 5 positions */
+		/* -.--- */
+		return len + 5;
+	} else {
+		while (isdigit(*str) || (*str) == '.') {
+			str++;
+			len++;
+		}
+		return len;
+	}
+}
+
 /*
+	Extract data from the string provided by the device
+
+	Sample input strings
+	---------------------
+	4.031,0.674,2.725,0.000
+
+*/
+static noinline int spower2_parse_sample(const char* str, struct spower2_sample* sample)
+{
+	if (strlen(str) < 23) {
+		sample->m_volts = sample->m_ampere = sample->m_watt = sample->m_watthour = -1;
+		return 1;
+	}
+
+	str += spower2_parse_float(str, &sample->m_volts);
+	str += spower2_parse_float(str, &sample->m_ampere);
+	str += spower2_parse_float(str, &sample->m_watt);
+	str += spower2_parse_float(str, &sample->m_watthour);
+	return 0;
+}
+
+/* Read a sample from the input file */
+static int spower2_read_from_file(struct spower2_sample* sample)
+{
+	char kbuf[24] = {0}; /* 24 is the length of the expected string */
+	int ret;
+
+	// kernel_read is a wrapper for vfs_read with get_fs/set_fs already
+	// NOTICE: kernel_read prototype changed in linux >= 4.14 (this is the old one)
+	if ((ret = kernel_read(spower2_gbl.input_file, 0, kbuf, sizeof(kbuf))) > 0) {
+		return spower2_parse_sample(kbuf, sample);
+	}
+
+	return ret ? ret : -1;
+}
+
+static int spower2_thread_fn(void *data)
+{
+	struct spower2_sample sample = {0};
+	unsigned long flags;
+	unsigned long now;
+
+	allow_signal(SIGKILL);
+	while (!kthread_should_stop() && !signal_pending(spower2_gbl.reader_thread)) {
+		now = jiffies; // Save current time to use he same accross multiple calculations
+
+		if (spower2_read_from_file(&sample) == 0) {
+			pr_info("{ m_volts: %d, m_ampere: %d, m_watt: %d, m_watthour: %d }\n", sample.m_volts, sample.m_ampere, sample.m_watt, sample.m_watthour);
+			sample.timestamp = now;
+			sample.m_ujoules = sample.m_watt * (now - spower2_gbl.time_last_sample) * 1000 / HZ;
+			spower2_gbl.cummulative_energy += sample.m_ujoules;
+			spower2_gbl.time_last_sample = now;
+
+			write_lock_irqsave(&spower2_gbl.lock, flags);
+			insert_items_cbuffer_t(spower2_gbl.cbuffer, &sample, sizeof(struct spower2_sample));
+			write_unlock_irqrestore(&spower2_gbl.lock, flags);
+		}
+
+		// msleep(500); // Wait a little, otherwise this goes unnecessarily too fast
+	}
+
+	pr_info("THREAD STOPPING\n");
+	do_exit(0);
+	return 0;
+}
+
+static int get_summary_samples(unsigned long timestamp, struct spower2_sample* sample)
+{
+	int nr_samples = 0;
+	struct spower2_sample* cur;
+	iterator_cbuffer_t it = get_iterator_cbuffer_t(spower2_gbl.cbuffer, sizeof(struct spower2_sample));
+
+	memset(sample, 0, sizeof(struct spower2_sample));
+
+	while ((cur = iterator_next_cbuffer_t(&it))) {
+		if (cur->timestamp >= timestamp) {
+			sample->m_volts += cur->m_volts;
+			sample->m_ampere += cur->m_ampere;
+			sample->m_watt += cur->m_watt;
+			sample->m_watthour += cur->m_watthour;
+			sample->m_ujoules += cur->m_ujoules;
+			nr_samples++;
+		}
+	}
+
+	if (nr_samples > 0) {
+		sample->m_volts /= nr_samples;
+		sample->m_ampere /= nr_samples;
+		sample->m_watt /= nr_samples;
+		sample->m_watthour /= nr_samples;
+		/* Joules are cummulative, so no division here */
+	}
+
+	return nr_samples;
+}
+
+/*
+ * Get a sample that summarizes measurements collected from a given point
+ * The function returns the number of samples in the buffer used to obtain
+ * that sample (average).
+ */
+static int spower2_get_sample(unsigned long from, struct spower2_sample* sample)
+{
+	int nr_samples;
+	unsigned long flags;
+	read_lock_irqsave(&spower2_gbl.lock, flags);
+	nr_samples = get_summary_samples(from, sample);
+	read_unlock_irqrestore(&spower2_gbl.lock, flags);
+	return nr_samples;
+}
+
+/*
+ * [PMCTrack API]
  * Update cumulative energy counters in the thread structure and
  * set the associated virtual counts in the PMC sample structure
  */
@@ -148,7 +375,10 @@ static int spower2_on_new_sample(pmon_prof_t* prof,int cpu,pmc_sample_t* sample,
 	return 0;
 }
 
-/* Free up private data */
+/*
+ * [PMCTrack API]
+ * Free up private data
+ */
 static void spower2_on_free_task(pmon_prof_t* prof)
 {
 	if (prof->monitoring_mod_priv_data)
