@@ -19,6 +19,11 @@
 #include <pmc/monitoring_mod.h>
 #include <pmc/data_str/cbuffer.h>
 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,11,0)
+// for signal_pending
+#include <linux/sched/signal.h>
+#endif
+
 #define SPOWER2_MODULE_STR "Odroid Smart Power 2"
 #define SPOWER2_INPUT_FILE_PATH "/dev/ttyUSB0"
 #define CBUFFER_CAPACITY 16
@@ -240,15 +245,26 @@ static noinline int spower2_parse_sample(const char* str, struct spower2_sample*
 	return 0;
 }
 
+// This is just a wrapper
+static inline ssize_t spower2_readfile(struct file *file, void *buf, unsigned long count)
+{
+	// kernel_read is a wrapper for vfs_read with get_fs/set_fs already
+	// NOTICE: kernel_read prototype changed in linux >= 4.14 (this is the old one)
+#if LINUX_VERSION_CODE < KERNEL_VERSION(4,14,0)
+		return kernel_read(file, 0, buf, count);
+#else
+		static loff_t offset = 0;
+		return kernel_read(file, buf, count, &offset);
+#endif
+}
+
 /* Read a sample from the input file */
 static int spower2_read_from_file(struct spower2_sample* sample)
 {
 	char kbuf[24] = {0}; /* 24 is the length of the expected string */
 	int ret;
 
-	// kernel_read is a wrapper for vfs_read with get_fs/set_fs already
-	// NOTICE: kernel_read prototype changed in linux >= 4.14 (this is the old one)
-	if ((ret = kernel_read(spower2_gbl.input_file, 0, kbuf, sizeof(kbuf))) > 0) {
+	if ((ret = spower2_readfile(spower2_gbl.input_file, kbuf, sizeof(kbuf))) > 0) {
 		return spower2_parse_sample(kbuf, sample);
 	}
 
