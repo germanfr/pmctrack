@@ -282,7 +282,6 @@ static int spower2_thread_fn(void *data)
 		now = jiffies; // Save current time to use he same accross multiple calculations
 
 		if (spower2_read_from_file(&sample) == 0) {
-			pr_info("{ m_volts: %d, m_ampere: %d, m_watt: %d, m_watthour: %d }\n", sample.m_volts, sample.m_ampere, sample.m_watt, sample.m_watthour);
 			sample.timestamp = now;
 			sample.m_ujoules = sample.m_watt * (now - spower2_gbl.time_last_sample) * 1000 / HZ;
 			spower2_gbl.cummulative_energy += sample.m_ujoules;
@@ -292,11 +291,11 @@ static int spower2_thread_fn(void *data)
 			insert_items_cbuffer_t(spower2_gbl.cbuffer, &sample, sizeof(struct spower2_sample));
 			write_unlock_irqrestore(&spower2_gbl.lock, flags);
 		}
-
-		// msleep(500); // Wait a little, otherwise this goes unnecessarily too fast
 	}
 
-	pr_info("THREAD STOPPING\n");
+#ifdef DEBUG
+	pr_info(SPOWER2_MODULE_STR " thread stopping\n");
+#endif
 	do_exit(0);
 	return 0;
 }
