@@ -323,8 +323,7 @@ static int get_summary_samples(unsigned long timestamp, struct spower2_sample* s
 		sample->m_volts /= nr_samples;
 		sample->m_ampere /= nr_samples;
 		sample->m_watt /= nr_samples;
-		sample->m_watthour /= nr_samples;
-		/* Joules are cummulative, so no division here */
+		/* Joules (and watt-hour) are cummulative, so no division here */
 	}
 
 	return nr_samples;
